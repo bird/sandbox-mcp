@@ -91,6 +91,29 @@ SPAWN_POLICIES: dict[str, dict] = {
 
 _MAX_SPAWN_GENERATION = 2
 
+# VPN-enforced networking (Option B): boot VMs with VZFileHandleNetworkDeviceAttachment
+# so the host controls every packet. Requires sandbox-vpn + vpn-bridge binaries.
+# Unlisted sandbox names use normal container networking.
+NETWORK_POLICIES: dict[str, dict] = {
+    # "isolated-worker": {
+    #     "mode": "vpn",
+    #     "wireguard_config": "/path/to/wg0.conf",
+    #     "vm_ip": "10.99.0.2/24",
+    #     "gateway_ip": "10.99.0.1",
+    #     "dns": ["10.0.0.1"],
+    #     "mtu": 1420,
+    #     "kernel": "",    # empty = use default from container system
+    #     "rootfs": "",    # empty = derive from image
+    # },
+}
+
+_VPN_BIN_DIR = os.path.dirname(os.path.abspath(__file__))
+_VPN_LAUNCHER = os.path.join(
+    _VPN_BIN_DIR, "cmd", "sandbox-vpn", ".build", "release", "sandbox-vpn"
+)
+_VPN_BRIDGE = os.path.join(_VPN_BIN_DIR, "cmd", "vpn-bridge", "vpn-bridge")
+_VPN_SOCK_DIR = os.path.join(_STATE_DIR, "vpn-sockets")
+
 # Command audit log: max entries per sandbox
 AUDIT_LOG_SIZE = 100
 
@@ -1092,6 +1115,9 @@ class SandboxManager:
         self._spawn_seqs: dict[str, int] = {}
         self._parent_generations: dict[str, int] = {}
         self._derived_policies: dict[str, dict] = {}
+        self._vpn_procs: dict[
+            str, tuple[asyncio.subprocess.Process, asyncio.subprocess.Process]
+        ] = {}
         self._sync_jobs: dict[str, SyncJob] = {}
         self._port_forwards: dict[int, PortForward] = {}  # host_port -> PortForward
         self._started = False
@@ -1821,6 +1847,140 @@ class SandboxManager:
             f"Booted sandbox '{sandbox_name}': {sb.name} ({cpus} CPUs, {memory}{virt_str})"
         )
         return sb
+
+    async def _boot_vpn(self, sandbox_name: str) -> Sandbox:
+        """Boot a VM with VPN-enforced networking via sandbox-vpn + vpn-bridge.
+
+        Uses VZFileHandleNetworkDeviceAttachment for a raw L2 socket as the
+        VM's only NIC, routed through WireGuard. No other network path.
+        """
+        net_policy = NETWORK_POLICIES[sandbox_name]
+        cpus, memory, _ = self._get_profile(sandbox_name)
+        memory_mb = _parse_memory_mb(memory)
+
+        if not os.path.isfile(_VPN_LAUNCHER):
+            raise RuntimeError(
+                f"sandbox-vpn binary not found at {_VPN_LAUNCHER} "
+                "(build with: cd cmd/sandbox-vpn && swift build -c release)"
+            )
+        if not os.path.isfile(_VPN_BRIDGE):
+            raise RuntimeError(
+                f"vpn-bridge binary not found at {_VPN_BRIDGE} "
+                "(build with: cd cmd/vpn-bridge && go build .)"
+            )
+
+        os.makedirs(_VPN_SOCK_DIR, exist_ok=True)
+        socket_path = os.path.join(_VPN_SOCK_DIR, f"{sandbox_name}.sock")
+
+        kernel = net_policy.get("kernel", "")
+        rootfs = net_policy.get("rootfs", "")
+        if not kernel or not rootfs:
+            raise RuntimeError(
+                f"VPN boot requires explicit 'kernel' and 'rootfs' in "
+                f"NETWORK_POLICIES['{sandbox_name}']"
+            )
+
+        # 1. Launch sandbox-vpn (creates VM with L2 socket)
+        vpn_cmd = [
+            _VPN_LAUNCHER,
+            "--kernel",
+            kernel,
+            "--rootfs",
+            rootfs,
+            "--cpus",
+            str(cpus),
+            "--memory",
+            str(memory_mb),
+            "--socket-path",
+            socket_path,
+            "--virtio-vsock",
+        ]
+        vpn_proc = await asyncio.create_subprocess_exec(
+            *vpn_cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+
+        if not vpn_proc.stdout or not vpn_proc.stderr:
+            raise RuntimeError("sandbox-vpn process has no stdout/stderr pipe")
+        try:
+            line = await asyncio.wait_for(vpn_proc.stdout.readline(), timeout=30)
+        except asyncio.TimeoutError:
+            vpn_proc.terminate()
+            raise RuntimeError("sandbox-vpn did not produce metadata within 30s")
+
+        if not line:
+            stderr_out = await vpn_proc.stderr.read()
+            raise RuntimeError(
+                f"sandbox-vpn exited early: {stderr_out.decode().strip()}"
+            )
+
+        meta = json.loads(line)
+        log.info(f"sandbox-vpn started for '{sandbox_name}': {meta}")
+
+        # 2. Launch vpn-bridge (L2 socket <-> WireGuard tun)
+        vm_ip = net_policy.get("vm_ip", "10.99.0.2/24")
+        gateway_ip = net_policy.get("gateway_ip", "10.99.0.1")
+        mtu = net_policy.get("mtu", 1420)
+        wg_config = net_policy["wireguard_config"]
+
+        bridge_cmd = [
+            _VPN_BRIDGE,
+            "--socket",
+            socket_path,
+            "--wg-config",
+            wg_config,
+            "--vm-ip",
+            vm_ip,
+            "--gateway-ip",
+            gateway_ip,
+            "--mtu",
+            str(mtu),
+        ]
+        bridge_proc = await asyncio.create_subprocess_exec(
+            *bridge_cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+
+        self._vpn_procs[sandbox_name] = (vpn_proc, bridge_proc)
+
+        # 3. Create Sandbox object — the VM is managed by sandbox-vpn, not
+        # the container CLI, so we use a synthetic container name.
+        container_name = f"mcp-vpn-{sandbox_name}"
+        sb = Sandbox(
+            name=container_name,
+            image=net_policy.get("image", self.image),
+            cpus=cpus,
+            memory_mb=memory_mb,
+        )
+
+        # TODO: open_shell() currently uses `container exec -i <name> sh`
+        # which won't work for VPN-booted VMs. Need vsock-based shell or
+        # direct pty over the Virtualization.framework console.
+        # For now, mark the sandbox but skip shell setup.
+        log.info(
+            f"VPN sandbox '{sandbox_name}' booted: {container_name} "
+            f"(vpn_pid={vpn_proc.pid}, bridge_pid={bridge_proc.pid})"
+        )
+        return sb
+
+    async def _stop_vpn(self, sandbox_name: str):
+        procs = self._vpn_procs.pop(sandbox_name, None)
+        if not procs:
+            return
+        vpn_proc, bridge_proc = procs
+        for proc in (bridge_proc, vpn_proc):
+            if proc.returncode is None:
+                proc.terminate()
+                try:
+                    await asyncio.wait_for(proc.wait(), timeout=5)
+                except asyncio.TimeoutError:
+                    proc.kill()
+        socket_path = os.path.join(_VPN_SOCK_DIR, f"{sandbox_name}.sock")
+        if os.path.exists(socket_path):
+            os.unlink(socket_path)
+        log.info(f"Stopped VPN processes for '{sandbox_name}'")
 
     async def _spawn_child(
         self,
