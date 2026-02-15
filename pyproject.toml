@@ -2,11 +2,26 @@
 name = "sandbox-mcp"
 version = "1.0.0"
 description = "MCP server for Apple Container sandboxes"
-license = "MIT"
+readme = "README.md"
+license = {text = "MIT"}
 requires-python = ">=3.11"
+keywords = ["mcp", "sandbox", "containers", "apple", "virtualization"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: MacOS",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+]
 dependencies = [
     "mcp[cli]>=1.4.1",
 ]
+
+[project.urls]
+Repository = "https://github.com/bird/sandbox-mcp"
+Issues = "https://github.com/bird/sandbox-mcp/issues"
 
 [dependency-groups]
 dev = ["pytest>=8.0"]
