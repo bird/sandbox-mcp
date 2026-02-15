@@ -219,7 +219,7 @@ class TestStateV2Format:
         assert p["cpus"] == 2
         assert p["memory_mb"] == 512
         assert p["spawn_seq"] == 3
-        assert p["generation"] == 7
+        assert p["generation"] == 0
 
         c = raw["sandboxes"]["child"]
         assert c["container"] == "mcp-sb-child"
@@ -563,5 +563,201 @@ def test_spawn_tools_roundtrip(mock_container_cli, monkeypatch: pytest.MonkeyPat
 
             listing_after = await smi.children(parent="parent-roundtrip")
             assert "No active children for 'parent-roundtrip'" in listing_after
+
+    asyncio.run(scenario())
+
+
+def test_grandchild_spawning(mock_container_cli, monkeypatch: pytest.MonkeyPatch):
+    import sandbox_mcp_server as smi
+
+    _configure_module(smi, monkeypatch, mock_container_cli)
+
+    async def scenario():
+        async with _manager(smi) as mgr:
+            monkeypatch.setattr(smi, "manager", mgr)
+            monkeypatch.setattr(
+                smi,
+                "SPAWN_POLICIES",
+                {
+                    "root": _make_spawn_policy(
+                        max_concurrent=10,
+                        max_total=10,
+                        total_child_cpus=6,
+                        total_child_memory_mb=2048,
+                        child_max_cpus=2,
+                        child_max_memory="512M",
+                        child_can_spawn=True,
+                        inject_ctl=False,
+                    )
+                },
+            )
+
+            await mgr.get_sandbox("root")
+            c1 = await mgr._spawn_child(
+                parent_name="root",
+                child_name="kid-a",
+                cpus=2,
+                memory="512M",
+            )
+            c2 = await mgr._spawn_child(
+                parent_name="root",
+                child_name="kid-b",
+                cpus=2,
+                memory="512M",
+            )
+            assert c1.generation == 1
+            assert c2.generation == 1
+            assert "kid-a" in mgr._derived_policies
+
+            grandchild = await mgr._spawn_child(
+                parent_name="kid-a",
+                child_name="gkid-1",
+                cpus=2,
+                memory="512M",
+            )
+            assert grandchild.generation == 2
+            assert grandchild.parent == "kid-a"
+
+            with pytest.raises(PermissionError, match="max spawn depth"):
+                await mgr._spawn_child(parent_name="gkid-1", child_name="nope")
+
+            with pytest.raises(smi.SpawnLimitError, match="CPU budget exceeded"):
+                await mgr._spawn_child(
+                    parent_name="kid-a",
+                    child_name="gkid-2",
+                    cpus=1,
+                    memory="512M",
+                )
+
+    asyncio.run(scenario())
+
+
+def test_root_budget_includes_grandchildren(
+    mock_container_cli, monkeypatch: pytest.MonkeyPatch
+):
+    """Root spawning a direct child must account for grandchildren already using budget."""
+    import sandbox_mcp_server as smi
+
+    _configure_module(smi, monkeypatch, mock_container_cli)
+
+    async def scenario():
+        async with _manager(smi) as mgr:
+            monkeypatch.setattr(smi, "manager", mgr)
+            # total_child_cpus=4: enough for kid-a(2) + gkid(1) = 3, but not +2 more
+            monkeypatch.setattr(
+                smi,
+                "SPAWN_POLICIES",
+                {
+                    "root": _make_spawn_policy(
+                        max_concurrent=10,
+                        max_total=10,
+                        total_child_cpus=4,
+                        total_child_memory_mb=2048,
+                        child_max_cpus=2,
+                        child_max_memory="512M",
+                        child_can_spawn=True,
+                        inject_ctl=False,
+                    )
+                },
+            )
+
+            await mgr.get_sandbox("root")
+            await mgr._spawn_child(
+                parent_name="root", child_name="kid-a", cpus=2, memory="512M"
+            )
+            await mgr._spawn_child(
+                parent_name="kid-a", child_name="gkid", cpus=1, memory="256M"
+            )
+
+            # kid-a(2) + gkid(1) = 3 used. Root's local check only sees kid-a(2),
+            # so without tree-wide accounting this would incorrectly pass.
+            with pytest.raises(smi.SpawnLimitError, match="CPU budget exceeded"):
+                await mgr._spawn_child(
+                    parent_name="root", child_name="kid-b", cpus=2, memory="256M"
+                )
+
+    asyncio.run(scenario())
+
+
+def test_inject_ctl_false(mock_container_cli, monkeypatch: pytest.MonkeyPatch):
+    import sandbox_mcp_server as smi
+
+    _configure_module(smi, monkeypatch, mock_container_cli)
+
+    async def scenario():
+        async with _manager(smi) as mgr:
+            monkeypatch.setattr(smi, "manager", mgr)
+            monkeypatch.setattr(
+                smi,
+                "SPAWN_POLICIES",
+                {"noctl": _make_spawn_policy(inject_ctl=False)},
+            )
+
+            await mgr.get_sandbox("noctl")
+            assert "noctl" not in mgr._ctl_server._listeners
+
+    asyncio.run(scenario())
+
+
+def test_generation_depth_limit(mock_container_cli, monkeypatch: pytest.MonkeyPatch):
+    import sandbox_mcp_server as smi
+
+    _configure_module(smi, monkeypatch, mock_container_cli)
+
+    async def scenario():
+        async with _manager(smi) as mgr:
+            monkeypatch.setattr(smi, "manager", mgr)
+            monkeypatch.setattr(
+                smi,
+                "SPAWN_POLICIES",
+                {"root": _make_spawn_policy(child_can_spawn=True, inject_ctl=False)},
+            )
+
+            await mgr.get_sandbox("root")
+            await mgr._spawn_child(parent_name="root", child_name="kid")
+            await mgr._spawn_child(parent_name="kid", child_name="gkid")
+
+            with pytest.raises(PermissionError, match="max spawn depth"):
+                await mgr._spawn_child(parent_name="gkid", child_name="too-deep")
+
+    asyncio.run(scenario())
+
+
+def test_derived_policy_values(mock_container_cli, monkeypatch: pytest.MonkeyPatch):
+    import sandbox_mcp_server as smi
+
+    _configure_module(smi, monkeypatch, mock_container_cli)
+
+    async def scenario():
+        async with _manager(smi) as mgr:
+            monkeypatch.setattr(smi, "manager", mgr)
+            monkeypatch.setattr(
+                smi,
+                "SPAWN_POLICIES",
+                {
+                    "p": _make_spawn_policy(
+                        max_concurrent=4,
+                        max_total=8,
+                        total_child_cpus=6,
+                        total_child_memory_mb=2048,
+                        child_ttl=600,
+                        child_can_spawn=True,
+                        inject_ctl=False,
+                    )
+                },
+            )
+
+            await mgr.get_sandbox("p")
+            await mgr._spawn_child(parent_name="p", child_name="c")
+
+            d = mgr._derived_policies["c"]
+            assert d["max_concurrent"] == 2
+            assert d["max_total"] == 4
+            assert d["total_child_cpus"] == 3
+            assert d["total_child_memory_mb"] == 1024
+            assert d["child_can_spawn"] is False
+            assert d["inject_ctl"] is False
+            assert d["allowed_images"] == ["mcp-dev"]
+            assert d["child_ttl"] <= 600
 
     asyncio.run(scenario())

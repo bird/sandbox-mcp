@@ -85,8 +85,11 @@ SPAWN_POLICIES: dict[str, dict] = {
         "child_can_spawn": False,
         "child_network_peers": "family",
         "child_allow_port_forward": False,
+        "inject_ctl": True,
     },
 }
+
+_MAX_SPAWN_GENERATION = 2
 
 # Command audit log: max entries per sandbox
 AUDIT_LOG_SIZE = 100
@@ -408,6 +411,7 @@ class Sandbox:
     role: str = "primary"
     parent: Optional[str] = None
     parent_generation: int = 0
+    generation: int = 0
     expires_at: Optional[float] = None
     cpus: int = SANDBOX_CPUS
     memory_mb: int = 512
@@ -1087,6 +1091,7 @@ class SandboxManager:
         self._sandbox_mounts: dict[str, dict] = {}
         self._spawn_seqs: dict[str, int] = {}
         self._parent_generations: dict[str, int] = {}
+        self._derived_policies: dict[str, dict] = {}
         self._sync_jobs: dict[str, SyncJob] = {}
         self._port_forwards: dict[int, PortForward] = {}  # host_port -> PortForward
         self._started = False
@@ -1143,12 +1148,12 @@ class SandboxManager:
                 "expires_at": sb.expires_at,
                 "cpus": sb.cpus,
                 "memory_mb": sb.memory_mb,
+                "generation": sb.generation,
             }
             if sb.role == "child":
                 info["parent_generation"] = sb.parent_generation
             else:
                 info["spawn_seq"] = spawn_seqs.get(sb_name, 0)
-                info["generation"] = parent_generations.get(sb_name, 0)
             sandboxes[sb_name] = info
 
         state = {
@@ -1156,6 +1161,7 @@ class SandboxManager:
             "written_at": time.time(),
             "spawn_seqs": spawn_seqs,
             "parent_generations": parent_generations,
+            "derived_policies": self._derived_policies.copy(),
             "sandboxes": sandboxes,
         }
         try:
@@ -1216,6 +1222,7 @@ class SandboxManager:
                 "spawn_seqs": {},
                 "parent_generations": {},
                 "sandboxes": sandboxes,
+                "derived_policies": {},
             }
 
         if schema != 2:
@@ -1226,6 +1233,7 @@ class SandboxManager:
             "written_at": raw.get("written_at", time.time()),
             "spawn_seqs": raw.get("spawn_seqs") or {},
             "parent_generations": raw.get("parent_generations") or {},
+            "derived_policies": raw.get("derived_policies") or {},
             "sandboxes": {},
         }
 
@@ -1247,12 +1255,12 @@ class SandboxManager:
                 "expires_at": info.get("expires_at"),
                 "cpus": info.get("cpus", SANDBOX_CPUS),
                 "memory_mb": info.get("memory_mb", _parse_memory_mb(SANDBOX_MEMORY)),
+                "generation": info.get("generation", 0),
             }
             if role == "child":
                 sb_info["parent_generation"] = info.get("parent_generation", 0)
             else:
                 sb_info["spawn_seq"] = info.get("spawn_seq", 0)
-                sb_info["generation"] = info.get("generation", 0)
             state["sandboxes"][sb_name] = sb_info
 
         return state
@@ -1359,6 +1367,7 @@ class SandboxManager:
                     role=role,
                     parent=info.get("parent"),
                     parent_generation=info.get("parent_generation", 0),
+                    generation=info.get("generation", 0),
                     expires_at=expires_at,
                     created_at=info.get("created_at", time.time()),
                     cpus=info.get("cpus", SANDBOX_CPUS),
@@ -1392,8 +1401,15 @@ class SandboxManager:
         if set(kept.keys()) != set(sandboxes.keys()):
             self._save_state()
 
+        self._derived_policies = {
+            k: v
+            for k, v in saved.get("derived_policies", {}).items()
+            if k in self._sandboxes
+        }
+
         for sb_name in list(self._sandboxes.keys()):
-            if sb_name in SPAWN_POLICIES and os.path.isfile(_CTL_BINARY):
+            p = self._get_effective_policy(sb_name)
+            if p and p.get("inject_ctl", True) and os.path.isfile(_CTL_BINARY):
                 try:
                     await self._ctl_server.start_for(sb_name)
                 except Exception as e:
@@ -1720,6 +1736,45 @@ class SandboxManager:
         virtualization = profile.get("virtualization", False)
         return cpus, memory, virtualization
 
+    def _get_effective_policy(self, name: str) -> Optional[dict]:
+        return SPAWN_POLICIES.get(name) or self._derived_policies.get(name)
+
+    def _root_name(self, sandbox_name: str) -> str:
+        name = sandbox_name
+        seen: set[str] = set()
+        while True:
+            if name in seen:
+                return name
+            seen.add(name)
+            sb = self._sandboxes.get(name)
+            if not sb or not sb.parent:
+                return name
+            name = sb.parent
+
+    def _derive_child_policy(self, parent_policy: dict, child_sb: Sandbox) -> dict:
+        child_ttl = parent_policy.get("child_ttl", 0)
+        if child_ttl > 0 and child_sb.expires_at:
+            remaining = max(0, child_sb.expires_at - time.time())
+            child_ttl = min(child_ttl, int(remaining))
+        return {
+            "max_concurrent": max(1, parent_policy.get("max_concurrent", 3) // 2),
+            "max_total": max(1, parent_policy.get("max_total", 10) // 2),
+            "total_child_cpus": max(1, parent_policy.get("total_child_cpus", 6) // 2),
+            "total_child_memory_mb": max(
+                128, parent_policy.get("total_child_memory_mb", 1536) // 2
+            ),
+            "child_max_cpus": parent_policy.get("child_max_cpus", SANDBOX_CPUS),
+            "child_max_memory": parent_policy.get("child_max_memory", SANDBOX_MEMORY),
+            "allowed_images": list(parent_policy.get("allowed_images", [])),
+            "child_ttl": child_ttl,
+            "child_can_spawn": False,
+            "child_network_peers": parent_policy.get("child_network_peers", "family"),
+            "child_can_be_cloned": False,
+            "child_can_be_snapshotted": False,
+            "child_allow_port_forward": False,
+            "inject_ctl": False,
+        }
+
     async def _boot_for(self, sandbox_name: str) -> Sandbox:
         """Cold-boot a sandbox with per-name volumes."""
         mounts = await _ensure_sandbox_volumes(sandbox_name)
@@ -1727,7 +1782,8 @@ class SandboxManager:
 
         extra_volumes: Optional[list[tuple[str, str]]] = None
         ctl_started = False
-        if sandbox_name in SPAWN_POLICIES and os.path.isfile(_CTL_BINARY):
+        policy = SPAWN_POLICIES.get(sandbox_name)
+        if policy and policy.get("inject_ctl", True) and os.path.isfile(_CTL_BINARY):
             await self._ctl_server.start_for(sandbox_name)
             ctl_started = True
             extra_volumes = [
@@ -1784,15 +1840,13 @@ class SandboxManager:
                 raise ValueError(f"No active sandbox '{parent_name}'")
 
             parent_sb = self._sandboxes[parent_name]
-            if parent_sb.role == "child":
-                grandparent = parent_sb.parent
-                gp_policy = SPAWN_POLICIES.get(grandparent) if grandparent else None
-                if not (gp_policy and gp_policy.get("child_can_spawn", False)):
-                    raise PermissionError(
-                        f"Sandbox '{parent_name}' is a child and may not spawn children"
-                    )
+            if parent_sb.generation >= _MAX_SPAWN_GENERATION:
+                raise PermissionError(
+                    f"Sandbox '{parent_name}' is at generation {parent_sb.generation} "
+                    f"(max spawn depth is {_MAX_SPAWN_GENERATION})"
+                )
 
-            policy = SPAWN_POLICIES.get(parent_name)
+            policy = self._get_effective_policy(parent_name)
             if not policy:
                 raise PermissionError(
                     f"Sandbox '{parent_name}' is not permitted to spawn children"
@@ -1844,6 +1898,24 @@ class SandboxManager:
             if used_child_memory_mb + memory_mb > policy["total_child_memory_mb"]:
                 raise SpawnLimitError("Aggregate child memory budget exceeded")
 
+            # Tree-wide budget: all descendants must fit root's policy.
+            # Catches cases the local per-parent check misses, e.g. root
+            # spawning a new child while grandchildren already exist.
+            root = self._root_name(parent_name)
+            root_policy = SPAWN_POLICIES.get(root)
+            if root_policy:
+                all_descendants = [
+                    s
+                    for n, s in self._sandboxes.items()
+                    if s.parent is not None and self._root_name(n) == root
+                ]
+                tree_cpus = sum(s.cpus for s in all_descendants)
+                tree_mem = sum(s.memory_mb for s in all_descendants)
+                if tree_cpus + cpus > root_policy["total_child_cpus"]:
+                    raise SpawnLimitError("CPU budget exceeded")
+                if tree_mem + memory_mb > root_policy["total_child_memory_mb"]:
+                    raise SpawnLimitError("Memory budget exceeded")
+
             if not child_name:
                 child_name = (
                     f"{parent_name}-child-{self._spawn_seqs.get(parent_name, 0):04d}"
@@ -1857,11 +1929,13 @@ class SandboxManager:
 
             child_extra: Optional[list[tuple[str, str]]] = None
             child_ctl = False
-            if (
+            child_will_spawn = (
                 policy.get("child_can_spawn", False)
-                and child_name in SPAWN_POLICIES
+                and policy.get("inject_ctl", True)
+                and (parent_sb.generation + 1) < _MAX_SPAWN_GENERATION
                 and os.path.isfile(_CTL_BINARY)
-            ):
+            )
+            if child_will_spawn:
                 await self._ctl_server.start_for(child_name)
                 child_ctl = True
                 child_extra = [
@@ -1892,6 +1966,7 @@ class SandboxManager:
                 await _inject_ctl_binary(sb)
 
             sb.role = "child"
+            sb.generation = parent_sb.generation + 1
             sb.parent = parent_name
             sb.parent_generation = self._parent_generations.get(parent_name, 0)
             sb.cpus = cpus
@@ -1902,6 +1977,15 @@ class SandboxManager:
             self._sandboxes[child_name] = sb
             self._spawn_seqs[parent_name] = self._spawn_seqs.get(parent_name, 0) + 1
             self._save_state()
+
+            if (
+                policy.get("child_can_spawn", False)
+                and sb.generation < _MAX_SPAWN_GENERATION
+            ):
+                derived = self._derive_child_policy(policy, sb)
+                self._derived_policies[child_name] = derived
+                self._spawn_seqs.setdefault(child_name, 0)
+                self._parent_generations.setdefault(child_name, 0)
 
             log.info(
                 f"Spawned child '{child_name}' for '{parent_name}': {sb.name} "
@@ -2327,6 +2411,7 @@ class SandboxManager:
                 pass
             if child_name in self._sandboxes:
                 del self._sandboxes[child_name]
+            self._derived_policies.pop(child_name, None)
             destroyed.append(child_name)
             log.info(
                 f"Destroyed child sandbox '{child_name}' ({container}) [parent={parent_name}]"
@@ -2359,6 +2444,7 @@ class SandboxManager:
 
         await sb.destroy()
         del self._sandboxes[name]
+        self._derived_policies.pop(name, None)
         self._save_state()
         log.info(f"Destroyed sandbox '{name}' ({container})")
         return f"Destroyed sandbox '{name}' ({container})"

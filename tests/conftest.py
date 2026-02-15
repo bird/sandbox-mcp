@@ -37,6 +37,7 @@ def _make_spawn_policy(**overrides: object) -> dict[str, object]:
         "child_can_be_cloned": False,
         "child_can_be_snapshotted": False,
         "child_allow_port_forward": False,
+        "inject_ctl": True,
     }
     base.update(overrides)
     return base
