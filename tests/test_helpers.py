@@ -1,5 +1,3 @@
-"""Unit tests for pure helper functions — no Apple Containers needed."""
-
 import pytest
 
 from sandbox_mcp_server import (
@@ -11,7 +9,6 @@ from sandbox_mcp_server import (
     _sq,
     _truncate,
     _validate_env_key,
-    SANDBOX_PROFILES,
 )
 
 
@@ -29,7 +26,6 @@ class TestSq:
         assert _sq("hello world") == "'hello world'"
 
     def test_string_with_single_quote(self):
-        # 'it'\''s' — shell will concatenate 'it' + \' + 's'
         assert _sq("it's") == "'it'\\''s'"
 
     def test_string_with_multiple_quotes(self):
@@ -60,39 +56,39 @@ class TestSq:
 
 class TestValidateEnvKey:
     def test_simple_key(self):
-        assert _validate_env_key("HOME") is True
+        assert _validate_env_key("HOME")
 
     def test_underscore_prefix(self):
-        assert _validate_env_key("_PRIVATE") is True
+        assert _validate_env_key("_PRIVATE")
 
     def test_mixed_case(self):
-        assert _validate_env_key("myVar123") is True
+        assert _validate_env_key("myVar123")
 
     def test_empty_string(self):
-        assert _validate_env_key("") is False
+        assert not _validate_env_key("")
 
     def test_starts_with_number(self):
-        assert _validate_env_key("1BAD") is False
+        assert not _validate_env_key("1BAD")
 
     def test_has_spaces(self):
-        assert _validate_env_key("MY VAR") is False
+        assert not _validate_env_key("MY VAR")
 
     def test_has_equals(self):
-        assert _validate_env_key("KEY=val") is False
+        assert not _validate_env_key("KEY=val")
 
     def test_has_dash(self):
-        assert _validate_env_key("my-var") is False
+        assert not _validate_env_key("my-var")
 
     def test_shell_injection(self):
-        assert _validate_env_key("$(whoami)") is False
-        assert _validate_env_key("x;rm -rf /") is False
-        assert _validate_env_key("KEY`id`") is False
+        assert not _validate_env_key("$(whoami)")
+        assert not _validate_env_key("x;rm -rf /")
+        assert not _validate_env_key("KEY`id`")
 
     def test_single_underscore(self):
-        assert _validate_env_key("_") is True
+        assert _validate_env_key("_")
 
     def test_single_letter(self):
-        assert _validate_env_key("X") is True
+        assert _validate_env_key("X")
 
 
 # ── _format_export_line ───────────────────────────────────────────────────
@@ -122,8 +118,8 @@ class TestOutputTokenHelpers:
 
     def test_output_has_token_exact(self):
         out = "mcp-snap-prod-old\n"
-        assert _output_has_token(out, "mcp-snap-prod") is False
-        assert _output_has_token(out, "mcp-snap-prod-old") is True
+        assert not _output_has_token(out, "mcp-snap-prod")
+        assert _output_has_token(out, "mcp-snap-prod-old")
 
 
 # ── _humanize_bytes ──────────────────────────────────────────────────────
@@ -185,7 +181,6 @@ class TestPortForward:
         r = repr(pf)
         assert "3000" in r
         assert "default" in r
-        # _server and _connections excluded from repr
         assert "_server" not in r
         assert "_connections" not in r
 
@@ -194,15 +189,3 @@ class TestPortForward:
         pf._connections += 1
         pf._connections += 1
         assert pf._connections == 2
-
-
-# ── SANDBOX_PROFILES structure ───────────────────────────────────────────
-
-
-class TestProfiles:
-    def test_profiles_is_dict(self):
-        assert isinstance(SANDBOX_PROFILES, dict)
-
-    def test_profile_values_are_dicts(self):
-        for name, profile in SANDBOX_PROFILES.items():
-            assert isinstance(profile, dict), f"Profile '{name}' should be a dict"

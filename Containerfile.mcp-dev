@@ -1,40 +1,12 @@
 FROM alpine:3.23
 
-# Core build tools
 RUN apk add --no-cache \
-    build-base \
-    cmake \
-    git \
-    curl \
-    wget \
-    jq \
-    tar \
-    gzip \
-    unzip \
-    openssh-client \
-    ca-certificates
+    build-base cmake git curl wget jq tar gzip unzip \
+    openssh-client ca-certificates \
+    python3 py3-pip py3-setuptools py3-wheel py3-virtualenv \
+    nodejs npm \
+    go \
+    rust cargo \
+ && mkdir -p /workspace
 
-# Python
-RUN apk add --no-cache \
-    python3 \
-    py3-pip \
-    py3-setuptools \
-    py3-wheel \
-    py3-virtualenv
-
-# Node.js
-RUN apk add --no-cache \
-    nodejs \
-    npm
-
-# Go
-RUN apk add --no-cache go
-
-# Rust
-RUN apk add --no-cache \
-    rust \
-    cargo
-
-# Create workspace
-RUN mkdir -p /workspace
 WORKDIR /workspace

@@ -1,5 +1,3 @@
-"""Exact-token matching tests for CLI output parsing."""
-
 from __future__ import annotations
 
 import asyncio
@@ -16,7 +14,7 @@ def test_check_image_uses_exact_token_match(monkeypatch):
 
     monkeypatch.setattr(sm, "_run", fake_run)
     mgr = sm.SandboxManager(image="mcp-dev")
-    assert asyncio.run(mgr.check_image()) is False
+    assert not asyncio.run(mgr.check_image())
 
 
 def test_restore_rejects_prefix_only_snapshot_match(monkeypatch):

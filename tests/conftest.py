@@ -1,11 +1,54 @@
-"""Test fixtures for mocked container CLI integration tests."""
-
 from __future__ import annotations
 
+import contextlib
 import os
 from pathlib import Path
 
 import pytest
+
+
+def _configure_module(
+    sm_mod, monkeypatch: pytest.MonkeyPatch, paths: dict[str, Path]
+) -> None:
+    state_file = paths["home_dir"] / ".local" / "state" / "sandbox-mcp" / "state.json"
+    env_file = paths["tmp_path"] / "mcp-env.sh"
+    monkeypatch.setattr(sm_mod, "STATE_FILE", str(state_file))
+    monkeypatch.setattr(sm_mod, "ENV_FILE", str(env_file))
+    monkeypatch.setattr(sm_mod, "_CTL_BINARY", "/nonexistent/sandbox-ctl")
+
+    async def _no_warm_boot(self):
+        return None
+
+    monkeypatch.setattr(sm_mod.SandboxManager, "_warm_boot", _no_warm_boot)
+
+
+def _make_spawn_policy(**overrides: object) -> dict[str, object]:
+    base: dict[str, object] = {
+        "max_concurrent": 3,
+        "max_total": 10,
+        "total_child_cpus": 8,
+        "total_child_memory_mb": 4096,
+        "child_max_cpus": 2,
+        "child_max_memory": "512M",
+        "allowed_images": ["mcp-dev"],
+        "child_ttl": 0,
+        "child_can_spawn": False,
+        "child_network_peers": "family",
+        "child_can_be_cloned": False,
+        "child_can_be_snapshotted": False,
+        "child_allow_port_forward": False,
+    }
+    base.update(overrides)
+    return base
+
+
+@contextlib.asynccontextmanager
+async def _manager(sm_mod):
+    mgr = sm_mod.SandboxManager()
+    try:
+        yield mgr
+    finally:
+        await mgr.shutdown()
 
 
 _FAKE_CONTAINER_SCRIPT = """#!/usr/bin/env python3
@@ -212,8 +255,9 @@ if __name__ == "__main__":
 
 
 @pytest.fixture
-def mock_container_cli(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> dict[str, Path]:
-    """Install a fake `container` binary and isolate HOME/STATE for tests."""
+def mock_container_cli(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> dict[str, Path]:
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     fake_container = bin_dir / "container"
