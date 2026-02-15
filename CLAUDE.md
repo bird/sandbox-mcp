@@ -1,11 +1,12 @@
 # sandbox-mcp
 
-MCP server for Apple Container sandboxes. Single-file Python server (`sandbox_mcp_server.py`, ~2850 lines) using FastMCP.
+MCP server for Apple Container sandboxes. Single-file Python server (`sandbox_mcp_server.py`) using FastMCP.
 
 ## Project structure
 
 ```
-sandbox_mcp_server.py   # Everything: Sandbox class, SandboxManager, 32 MCP tools
+sandbox_mcp_server.py   # Sandbox class, SandboxManager, MCP tools
+cmd/sandbox-ctl/       # In-container CLI for spawning sibling containers (Go)
 pyproject.toml          # uv/hatchling packaging, entry point: sandbox-mcp
 Containerfile.mcp-dev   # Alpine 3.23 image with Python/Node/Go/Rust
 tests/                  # pytest test suite
@@ -36,6 +37,4 @@ uv run pytest tests/ -v
 
 1. Add manager method to `SandboxManager` class
 2. Add `@mcp_server.tool()` function that calls the manager method
-3. Update the docstring tool list at the top of the file
-4. Add to permissions in `~/.claude/settings.local.json`
-5. Run tests
+3. Run tests
