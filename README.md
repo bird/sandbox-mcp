@@ -168,9 +168,11 @@ Sandboxes can spawn child sandboxes, controlled by `SPAWN_POLICIES` at the top o
 
 Children are lightweight — they skip cache volumes and get their own isolated workspace. They're auto-destroyed when their TTL expires or their parent is reset/destroyed.
 
+Setting `child_can_spawn: True` in a policy allows children to spawn their own children (grandchildren), up to a depth of `_MAX_SPAWN_GENERATION` (default 2). Grandchild policies are derived automatically — halved concurrency/budget limits, no further sub-spawning. A tree-wide budget check ensures the root sandbox's CPU/memory envelope is never exceeded regardless of spawn depth. This is off by default and not recommended for most use cases.
+
 ### In-container API (`sandbox-ctl`)
 
-When a sandbox has a spawn policy, the server mounts a UDS socket and the `sandbox-ctl` binary into the VM. Code running inside the VM can then spawn/manage sibling containers:
+When a sandbox has a spawn policy with `inject_ctl: True` (the default), the server mounts a UDS socket and the `sandbox-ctl` binary into the VM. Set `inject_ctl: False` to skip injection for sandboxes that don't need in-VM sub-launching. Code running inside the VM can then spawn/manage sibling containers:
 
 ```bash
 sandbox-ctl ping                                          # verify connection
@@ -275,6 +277,7 @@ Edit constants at the top of `sandbox_mcp_server.py`:
 | `DEFAULT_TIMEOUT` | `30` | Default command timeout in seconds |
 | `MAX_OUTPUT` | `50000` | Max output bytes per command |
 | `SPAWN_POLICIES` | `{"default": {...}}` | Per-sandbox child spawn limits and permissions |
+| `_MAX_SPAWN_GENERATION` | `2` | Maximum spawn depth (root → child → grandchild) |
 
 ## Testing
 
